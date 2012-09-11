@@ -23,7 +23,6 @@
 //  THE SOFTWARE.
 
 #import "BWHockeyManager.h"
-#import "BWGlobal.h"
 #import "BWApp.h"
 #import "NSString+HockeyAdditions.h"
 #import "UIImage+HockeyAdditions.h"
@@ -39,6 +38,9 @@
 #define BETA_UPDATE_VERSION         @"version"
 #define BETA_UPDATE_TIMESTAMP       @"timestamp"
 #define BETA_UPDATE_APPSIZE         @"appsize"
+
+#define SDK_NAME @"Hockey"
+#define SDK_VERSION @"2.0.7"
 
 @interface BWHockeyManager ()
 - (NSString *)getDevicePlatform_;
@@ -213,7 +215,7 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
 }
 
 - (NSString *)currentUsageString {
-  double currentUsageTime = [(NSNumber *)[[NSUserDefaults standardUserDefaults] valueForKey:kUsageTimeOfCurrentVersion] doubleValue];
+  double currentUsageTime = [[NSUserDefaults standardUserDefaults] doubleForKey:kUsageTimeOfCurrentVersion];
   
   if (currentUsageTime > 0) {
     // round (up) to 1 minute
@@ -226,20 +228,23 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
 - (NSString *)installationDateString {
   NSDateFormatter *formatter = [[[NSDateFormatter alloc] init] autorelease];
   [formatter setDateFormat:@"MM/dd/yyyy"];
-  return [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceReferenceDate:[(NSNumber *)[[NSUserDefaults standardUserDefaults] valueForKey:kDateOfVersionInstallation] doubleValue]]];
+  double installationTimeStamp = [[NSUserDefaults standardUserDefaults] doubleForKey:kDateOfVersionInstallation];
+  if (installationTimeStamp == 0.0f) {
+    return [formatter stringFromDate:[NSDate date]];
+  } else {
+    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceReferenceDate:installationTimeStamp]];
+  }
 }
 
 - (NSString *)deviceIdentifier {
-  if ([[UIDevice currentDevice] respondsToSelector:@selector(uniqueIdentifier)]) {
-    if (!isAppStoreEnvironment_) {
-      return [[UIDevice currentDevice] performSelector:@selector(uniqueIdentifier)];
-    } else {
-      return @"appstore";
+  if ([delegate_ respondsToSelector:@selector(customDeviceIdentifier)]) {
+    NSString *identifier = [delegate_ performSelector:@selector(customDeviceIdentifier)];
+    if (identifier && [identifier length] > 0) {
+      return identifier;
     }
   }
-  else {
-    return @"invalid";
-  }
+  
+  return @"invalid";
 }
 
 - (NSString *)authenticationToken {
@@ -544,7 +549,7 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
 
 - (void)showCheckForUpdateAlert_ {
   if (!updateAlertShowing_) {
-    if ([self.app.mandatory boolValue] ) {
+    if ([self hasNewerMandatoryVersion]) {
       UIAlertView *alertView = [[[UIAlertView alloc] initWithTitle:BWHockeyLocalize(@"HockeyUpdateAvailable")
                                                            message:[NSString stringWithFormat:BWHockeyLocalize(@"HockeyUpdateAlertMandatoryTextWithAppVersion"), [self.app nameAndVersionString]]
                                                           delegate:self
@@ -639,6 +644,9 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
   NSError *error = nil;
   id feedResult = nil;
   
+  if (!jsonString)
+    return nil;
+  
 #if BW_NATIVE_JSON_AVAILABLE
   feedResult = [NSJSONSerialization JSONObjectWithData:[jsonString dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
 #else
@@ -653,6 +661,10 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
     invocation.target = nsjsonClass;
     invocation.selector = nsjsonSelect;
     NSData *jsonData = [jsonString dataUsingEncoding:NSUTF8StringEncoding];
+    
+    if (!jsonData)
+      return nil;
+    
     [invocation setArgument:&jsonData atIndex:2]; // arguments 0 and 1 are self and _cmd respectively, automatically set by NSInvocation
     NSUInteger readOptions = kNilOptions;
     [invocation setArgument:&readOptions atIndex:3];
@@ -688,13 +700,13 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
     [invocation invoke];
     [invocation getReturnValue:&feedResult];
   } else {
-    NSLog(@"Error: You need a JSON Framework in your runtime!");
-    [self doesNotRecognizeSelector:_cmd];
+    error = [NSError errorWithDomain:kHockeyErrorDomain
+                                code:HockeyAPIServerReturnedEmptyResponse
+                            userInfo:[NSDictionary dictionaryWithObjectsAndKeys:@"You need a JSON Framework in your runtime for iOS4!", NSLocalizedDescriptionKey, nil]];
   }
 #endif
   
   if (error) {
-    BWHockeyLog(@"Error while parsing response feed: %@", [error localizedDescription]);
     [self reportError_:error];
     return nil;
   }
@@ -807,11 +819,11 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
 }
 
 - (void)checkForUpdate {
+  if (!updateURL_) return;
   if (!isAppStoreEnvironment_) {
     if (self.requireAuthorization) return;
-    if (self.isUpdateAvailable && [self.app.mandatory boolValue]) {
+    if (self.isUpdateAvailable && [self hasNewerMandatoryVersion]) {
       [self showCheckForUpdateAlert_];
-      return;
     }
   }
   [self checkForUpdateShowFeedback:NO];
@@ -831,9 +843,11 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
     return;
   }
   
-  NSMutableString *parameter = [NSMutableString stringWithFormat:@"api/2/apps/%@?format=json&udid=%@", 
+  NSMutableString *parameter = [NSMutableString stringWithFormat:@"api/2/apps/%@?format=json&udid=%@&sdk=%@&sdk_version=%@", 
                                 [self encodedAppIdentifier_],
-                                [[self deviceIdentifier] bw_URLEncodedString]];
+                                [[self deviceIdentifier] bw_URLEncodedString],
+                                SDK_NAME,
+                                SDK_VERSION];
   
   // add additional statistics if user didn't disable flag
   if ([self canSendUserData]) {
@@ -1055,7 +1069,7 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
       [alert release];
     }
     
-    if (self.isUpdateAvailable && (self.alwaysShowUpdateReminder || newVersionDiffersFromCachedVersion || [self.app.mandatory boolValue])) {
+    if (self.isUpdateAvailable && (self.alwaysShowUpdateReminder || newVersionDiffersFromCachedVersion || [self hasNewerMandatoryVersion])) {
       if (updateAvailable_ && !currentHockeyViewController_) {
         [self showCheckForUpdateAlert_];
       }
@@ -1067,6 +1081,22 @@ static NSString *kHockeyErrorDomain = @"HockeyErrorDomain";
   }
 }
 
+
+- (BOOL)hasNewerMandatoryVersion {
+  BOOL result = NO;
+  
+  for (BWApp *app in self.apps) {
+    if ([app.version isEqualToString:self.currentAppVersion] || [app.version versionCompare:self.currentAppVersion] == NSOrderedAscending) {
+      break;
+    }
+    
+    if ([app.mandatory boolValue]) {
+      result = YES;
+    }
+  }
+
+  return result;
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark -
