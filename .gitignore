@@ -22,3 +22,7 @@ bin
 *.swp
 *~.nib
 profile
+
+# Eclipse project files
+.classpath
+.project
